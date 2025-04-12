@@ -76,7 +76,7 @@ Make sure you have the following installed:
 
 1. **Clone the Repository**  
    ```bash
-   git clone https://github.com/your-username/lb-pump.git
+   git clone https://github.com/topsecretagent007/lb-pump.git
    ```
 
 2. **Navigate to the Project Directory**  
