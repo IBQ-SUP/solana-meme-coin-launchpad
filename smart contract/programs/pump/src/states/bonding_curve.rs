@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::Mint;
 
 use crate::errors::PumpError;
+use crate::consts::PRICE_PRECISION;
 use crate::utils::{sol_transfer_from_user, sol_transfer_with_signer, token_transfer_user, token_transfer_with_signer};
 
 #[account]
@@ -42,6 +43,38 @@ impl<'info> BondingCurve {
         Ok(false)
     }
 
+    //  get current token price in lamports
+    pub fn get_current_price(&self) -> Result<u64> {
+        if self.virtual_token_reserves == 0 {
+            return Ok(0);
+        }
+        
+        let price = self.virtual_sol_reserves
+            .checked_mul(PRICE_PRECISION) //  multiply by 1M for precision
+            .ok_or(PumpError::OverflowOrUnderflowOccurred)?
+            .checked_div(self.virtual_token_reserves)
+            .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+            
+        Ok(price)
+    }
+
+    //  get price impact for a given amount
+    pub fn get_price_impact(&self, amount_in: u64, direction: u8) -> Result<f64> {
+        if self.virtual_sol_reserves == 0 || self.virtual_token_reserves == 0 {
+            return Ok(0.0);
+        }
+        
+        let impact = if direction == 0 {
+            //  buy: impact on SOL reserves
+            (amount_in as f64 / self.virtual_sol_reserves as f64) * 100.0
+        } else {
+            //  sell: impact on token reserves  
+            (amount_in as f64 / self.virtual_token_reserves as f64) * 100.0
+        };
+        
+        Ok(impact)
+    }
+
     //  swap sol for token
     pub fn buy(
         &mut self,
@@ -64,6 +97,9 @@ impl<'info> BondingCurve {
         system_program: &AccountInfo<'info>, //  system program
         token_program: &AccountInfo<'info>,  //  token program
     ) -> Result<bool> {
+        //  validate input parameters
+        require!(amount_in > 0, PumpError::IncorrectValue);
+        require!(fee_percent >= 0.0 && fee_percent <= 100.0, PumpError::IncorrectValue);
         
         let (amount_out, fee_lamports) =
             self.calc_amount_out(amount_in, token_mint.decimals, 0, fee_percent)?;
@@ -72,6 +108,12 @@ impl<'info> BondingCurve {
         require!(
             amount_out >= min_amount_out,
             PumpError::ReturnAmountTooSmall
+        );
+
+        //  check if curve has enough tokens
+        require!(
+            amount_out <= self.real_token_reserves,
+            PumpError::IncorrectValue
         );
 
         //  transfer fee to team wallet
@@ -97,6 +139,11 @@ impl<'info> BondingCurve {
         let new_sol_reserves = self
             .virtual_sol_reserves
             .checked_add(amount_in - fee_lamports)
+            .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+
+        //  update real reserves
+        self.real_token_reserves = self.real_token_reserves
+            .checked_sub(amount_out)
             .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
 
         msg! {"Reserves:: Token: {:?} SOL: {:?}", new_token_reserves, new_sol_reserves};
@@ -126,7 +173,7 @@ impl<'info> BondingCurve {
         user_ata: &mut AccountInfo<'info>, //  associated toke accounts for user
         curve_ata: &mut AccountInfo<'info>, //  associated toke accounts for curve
 
-        amount_in: u64,      //  sol amount to pay
+        amount_in: u64,      //  token amount to pay
         min_amount_out: u64, //  minimum amount out
         fee_percent: f64,    //  sell fee
 
@@ -135,6 +182,10 @@ impl<'info> BondingCurve {
         system_program: &AccountInfo<'info>, //  system program
         token_program: &AccountInfo<'info>,  //  token program
     ) -> Result<()> {
+        //  validate input parameters
+        require!(amount_in > 0, PumpError::IncorrectValue);
+        require!(fee_percent >= 0.0 && fee_percent <= 100.0, PumpError::IncorrectValue);
+        
         let (amount_out, fee_lamports) =
             self.calc_amount_out(amount_in, token_mint.decimals, 1, fee_percent)?;
 
@@ -142,6 +193,12 @@ impl<'info> BondingCurve {
         require!(
             amount_out >= min_amount_out,
             PumpError::ReturnAmountTooSmall
+        );
+
+        //  check if curve has enough SOL
+        require!(
+            amount_out + fee_lamports <= self.real_sol_reserves,
+            PumpError::IncorrectValue
         );
 
         let token = token_mint.key();
@@ -182,6 +239,15 @@ impl<'info> BondingCurve {
             .checked_sub(amount_out + fee_lamports)
             .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
 
+        //  update real reserves
+        self.real_token_reserves = self.real_token_reserves
+            .checked_add(amount_in)
+            .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+        
+        self.real_sol_reserves = self.real_sol_reserves
+            .checked_sub(amount_out + fee_lamports)
+            .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+
         msg! {"Reserves:: Token: {:?} SOL: {:?}", new_token_reserves, new_sol_reserves};
 
         //  update reserves on the curve
@@ -193,15 +259,93 @@ impl<'info> BondingCurve {
     //  calculate amount out and fee lamports
     fn calc_amount_out(
         &mut self,
-        _amount_in: u64,
-        _token_decimal: u8, //  decimal for token
-        _direction: u8,     //  0 - buy, 1 - sell
-        _fee_percent: f64,
+        amount_in: u64,
+        token_decimal: u8, //  decimal for token
+        direction: u8,     //  0 - buy, 1 - sell
+        fee_percent: f64,
     ) -> Result<(u64, u64)> {
-        //  implement your curve fomula
-        let amount_out = 0;
-        let fee_lamports = 0;
+        //  implement bonding curve formula using constant product AMM
+        //  k = virtual_token_reserves * virtual_sol_reserves
+        
+        let k = self.virtual_token_reserves
+            .checked_mul(self.virtual_sol_reserves)
+            .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+        
+        let fee_lamports = (amount_in as f64 * fee_percent / 100.0) as u64;
+        let adjusted_amount_in = amount_in.checked_sub(fee_lamports)
+            .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+        
+        let amount_out = if direction == 0 {
+            //  buy: swap SOL for tokens
+            //  new_sol_reserves = virtual_sol_reserves + adjusted_amount_in
+            //  new_token_reserves = k / new_sol_reserves
+            //  amount_out = virtual_token_reserves - new_token_reserves
+            let new_sol_reserves = self.virtual_sol_reserves
+                .checked_add(adjusted_amount_in)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+            
+            let new_token_reserves = k.checked_div(new_sol_reserves)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+            
+            self.virtual_token_reserves
+                .checked_sub(new_token_reserves)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?
+        } else {
+            //  sell: swap tokens for SOL
+            //  new_token_reserves = virtual_token_reserves + amount_in
+            //  new_sol_reserves = k / new_token_reserves
+            //  amount_out = virtual_sol_reserves - new_sol_reserves
+            let new_token_reserves = self.virtual_token_reserves
+                .checked_add(amount_in)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+            
+            let new_sol_reserves = k.checked_div(new_token_reserves)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+            
+            self.virtual_sol_reserves
+                .checked_sub(new_sol_reserves)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?
+        };
 
         Ok((amount_out, fee_lamports))
+    }
+
+    //  estimate amount out for a given input (without fees)
+    pub fn estimate_amount_out(&self, amount_in: u64, direction: u8) -> Result<u64> {
+        if self.virtual_sol_reserves == 0 || self.virtual_token_reserves == 0 {
+            return Ok(0);
+        }
+        
+        let k = self.virtual_token_reserves
+            .checked_mul(self.virtual_sol_reserves)
+            .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+        
+        let amount_out = if direction == 0 {
+            //  buy: estimate tokens received for SOL
+            let new_sol_reserves = self.virtual_sol_reserves
+                .checked_add(amount_in)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+            
+            let new_token_reserves = k.checked_div(new_sol_reserves)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+            
+            self.virtual_token_reserves
+                .checked_sub(new_token_reserves)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?
+        } else {
+            //  sell: estimate SOL received for tokens
+            let new_token_reserves = self.virtual_token_reserves
+                .checked_add(amount_in)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+            
+            let new_sol_reserves = k.checked_div(new_token_reserves)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?;
+            
+            self.virtual_sol_reserves
+                .checked_sub(new_sol_reserves)
+                .ok_or(PumpError::OverflowOrUnderflowOccurred)?
+        };
+        
+        Ok(amount_out)
     }
 }

@@ -19,4 +19,7 @@ pub enum PumpError {
 
     #[msg("Curve is already completed")]
     CurveAlreadyCompleted,
+
+    #[msg("Insufficient reserves for this operation")]
+    InsufficientReserves,
 }

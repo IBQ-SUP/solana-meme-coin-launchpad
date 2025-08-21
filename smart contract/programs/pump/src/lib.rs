@@ -55,4 +55,11 @@ pub mod pump {
     ) -> Result<()> {
         ctx.accounts.process(nonce)
     }
+
+    //  get curve information (view function)
+    pub fn get_curve_info<'info>(
+        ctx: Context<'_, '_, '_, 'info, GetCurveInfo<'info>>,
+    ) -> Result<()> {
+        ctx.accounts.process()
+    }
 }

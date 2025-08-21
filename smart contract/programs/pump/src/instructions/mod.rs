@@ -6,3 +6,5 @@ pub mod swap;
 pub use swap::*;
 pub mod migrate;
 pub use migrate::*;
+pub mod get_curve_info;
+pub use get_curve_info::*;
