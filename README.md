@@ -1,6 +1,4 @@
-# 🚀 **LB PUMP**  
-
-![Screenshot 2025-02-14 191117](https://github.com/user-attachments/assets/3f53e4e0-aaea-4132-bd73-be08036804a6)
+# 🚀 **LB PUMP.FUN**  
 
 https://github.com/user-attachments/assets/d65b9270-6b99-44aa-aa0f-bc376c992589
 
